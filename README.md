@@ -226,6 +226,17 @@ with tracer.start_as_current_span(f"tool.{tool_name}") as span:
 
 ## Troubleshooting
 
+### Issue: "authorization required" (403 error)
+
+**Solution:** First-time users need to authorize Arcade to access tools like Gmail and Google Docs.
+
+When you see this error, the workflow will automatically:
+1. Display an authorization URL
+2. Wait for you to complete authorization in your browser
+3. Continue execution after you press Enter
+
+Simply open the displayed URL, grant the requested permissions, and return to your terminal to continue.
+
 ### Issue: "Missing required environment variables"
 
 **Solution:** Ensure all required variables are set in your `.env` file. Run:
@@ -236,7 +247,7 @@ cat .env  # Verify file exists and has correct values
 ### Issue: "No required tools found"
 
 **Solution:** Your Arcade user may not have access to Gmail/Google Docs tools. Either:
-- Connect the required services in Arcade dashboard
+- Authorize the tools when prompted (see authorization issue above)
 - Modify `REQUIRED_ARCADE_TOOLS` in `workflow.py` to use tools you have access to
 
 ### Issue: "Traces not appearing in Galileo"

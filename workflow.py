@@ -73,6 +73,43 @@ def create_agent(tools: List[Dict[str, Any]]) -> Any:
     return llm.bind_tools(tools)
 
 
+def _handle_arcade_authorization(arcade: Arcade, tool_name: str, user_id: str) -> bool:
+    """Handle Arcade tool authorization flow."""
+    try:
+        print("\n" + "=" * 60)
+        print(f"⚠️  Authorization Required for {tool_name}")
+        print("=" * 60)
+        
+        # Get authorization URL from Arcade
+        auth_response = arcade.tools.authorize(
+            tool_name=tool_name,
+            user_id=user_id
+        )
+        
+        # Check if already authorized
+        if auth_response.status == "completed":
+            print("✓ Already authorized\n")
+            return True
+        
+        # Display authorization URL
+        print(f"\nPlease authorize this tool by visiting:")
+        print(f"\n🔗 {auth_response.url}\n")
+        print("After authorizing in your browser, press Enter to continue...")
+        
+        input()
+        
+        # Wait for authorization to complete
+        print("⏳ Waiting for authorization...")
+        arcade.auth.wait_for_completion(auth_response)
+        
+        print("✓ Authorization complete!\n")
+        return True
+        
+    except Exception as e:
+        print(f"Error during authorization: {e}", file=sys.stderr)
+        return False
+
+
 def _execute_tool_call(
     tool_call: Dict[str, Any],
     arcade: Arcade,
@@ -85,22 +122,54 @@ def _execute_tool_call(
     
     print(f"[Round {round_num}] Executing: {tool_name}")
     
-    result = execute_tool_with_tracing(
-        tool_name=tool_name,
-        tool_executor=lambda: arcade.tools.execute(
+    try:
+        result = execute_tool_with_tracing(
             tool_name=tool_name,
-            input=tool_args,
-            user_id=user_id
-        ),
-        inputs=tool_args
-    )
-    
-    return {
-        "tool_call_id": tool_call.get("id", ""),
-        "role": "tool",
-        "name": tool_name,
-        "content": str(result)
-    }
+            tool_executor=lambda: arcade.tools.execute(
+                tool_name=tool_name,
+                input=tool_args,
+                user_id=user_id
+            ),
+            inputs=tool_args
+        )
+        
+        return {
+            "tool_call_id": tool_call.get("id", ""),
+            "role": "tool",
+            "name": tool_name,
+            "content": str(result)
+        }
+        
+    except Exception as e:
+        error_msg = str(e)
+        
+        # Check if this is an authorization error (403)
+        if "403" in error_msg and "authorization required" in error_msg.lower():
+            print(f"\n⚠️  Tool requires authorization")
+            
+            # Handle authorization flow
+            if _handle_arcade_authorization(arcade, tool_name, user_id):
+                # Retry after authorization
+                print(f"Retrying {tool_name}...")
+                result = execute_tool_with_tracing(
+                    tool_name=tool_name,
+                    tool_executor=lambda: arcade.tools.execute(
+                        tool_name=tool_name,
+                        input=tool_args,
+                        user_id=user_id
+                    ),
+                    inputs=tool_args
+                )
+                
+                return {
+                    "tool_call_id": tool_call.get("id", ""),
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": str(result)
+                }
+        
+        # Re-raise if not an auth error or auth failed
+        raise
 
 
 def _process_tool_calls(
