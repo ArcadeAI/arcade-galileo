@@ -1,248 +1,105 @@
+#!/usr/bin/env python3
 """
-Arcade + Galileo Integration Demo
+MCP + Galileo Demo
 
-Demonstrates agentic workflow with Arcade tools and Galileo observability.
+Reads the last email via Arcade MCP Gateway with automatic OpenTelemetry tracing.
+LangChain auto-instrumentation sends traces (including tool calls)to Galileo - zero manual tracing code.
+
 """
 
+import asyncio
 import os
 import sys
-from typing import Any, Dict, List, Optional, Tuple
 
-from arcadepy import Arcade
+from dotenv import load_dotenv
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
+from openinference.instrumentation.langchain import LangChainInstrumentor
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-from instrumentation import execute_tool_with_tracing, tracer
+load_dotenv()
 
-MAX_WORKFLOW_ROUNDS = 5
-DEFAULT_LLM_MODEL = "gpt-4o"
-DEFAULT_LLM_TEMPERATURE = 0.7
+# Configuration
+GALILEO_API_KEY = os.getenv("GALILEO_API_KEY")
+GALILEO_PROJECT_NAME = os.getenv("GALILEO_PROJECT_NAME")
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL")
+ARCADE_API_KEY = os.getenv("ARCADE_API_KEY")
+ARCADE_USER_ID = os.getenv("ARCADE_USER_ID")
 
-REQUIRED_ARCADE_TOOLS = [
-    "Gmail_ListEmailsByHeader",
-    "GoogleDocs_CreateDocumentFromText",
-    "Gmail_SendEmail",
-]
-
-
-def validate_environment() -> None:
-    """Validate required environment variables are set."""
-    required = [
-        "OPENAI_API_KEY",
-        "ARCADE_API_KEY",
-        "ARCADE_USER_ID",
-        "GALILEO_API_KEY",
-        "GALILEO_PROJECT_NAME",
-    ]
-    
-    missing = [var for var in required if not os.getenv(var)]
-    if missing:
-        print(f"Error: Missing environment variables: {', '.join(missing)}", file=sys.stderr)
-        sys.exit(1)
+ALLOWED_TOOLS = ["Gmail_ListEmails", "Gmail_ListEmailsByHeader"]
 
 
-def load_arcade_tools() -> Tuple[List[Dict[str, Any]], Arcade, str]:
-    """Load and filter Arcade tools in OpenAI format."""
-    print("Loading Arcade tools (this takes ~30 seconds)...")
-    
-    api_key = os.getenv("ARCADE_API_KEY")
-    user_id = os.getenv("ARCADE_USER_ID")
-    arcade = Arcade(api_key=api_key)
-    
-    tools_page = arcade.tools.formatted.list(user_id=user_id, format="openai")
-    all_tools = list(tools_page)
-    
-    tools = [
-        tool for tool in all_tools 
-        if any(name in tool['function']['name'] for name in REQUIRED_ARCADE_TOOLS)
-    ]
-    
-    if not tools:
-        raise RuntimeError(f"Required tools not found: {REQUIRED_ARCADE_TOOLS}")
-    
-    print(f"Loaded {len(tools)} tools: {', '.join(t['function']['name'] for t in tools)}")
-    return tools, arcade, user_id
+def setup_telemetry() -> TracerProvider:
+    """Configure OpenTelemetry to export traces to Galileo."""
+    if not GALILEO_API_KEY or not GALILEO_PROJECT_NAME:
+        sys.exit("Error: GALILEO_API_KEY and GALILEO_PROJECT_NAME required")
 
-
-def create_agent(tools: List[Dict[str, Any]]) -> Any:
-    """Create LangChain agent with tools."""
-    llm = ChatOpenAI(
-        model=DEFAULT_LLM_MODEL,
-        temperature=DEFAULT_LLM_TEMPERATURE,
-        api_key=os.getenv("OPENAI_API_KEY")
+    provider = TracerProvider(
+        resource=Resource.create({"service.name": "arcade-mcp-demo", "service.version": "1.0.0"})
     )
-    return llm.bind_tools(tools)
 
-
-def _handle_arcade_authorization(arcade: Arcade, tool_name: str, user_id: str) -> bool:
-    """Handle Arcade tool authorization flow."""
-    try:
-        print("\n" + "=" * 60)
-        print(f"⚠️  Authorization Required for {tool_name}")
-        print("=" * 60)
-        
-        # Get authorization URL from Arcade
-        auth_response = arcade.tools.authorize(
-            tool_name=tool_name,
-            user_id=user_id
+    provider.add_span_processor(
+        BatchSpanProcessor(
+            OTLPSpanExporter(
+                endpoint=os.getenv("GALILEO_OTLP_ENDPOINT", "https://api.galileo.ai/otel/traces"),
+                headers={
+                    "Galileo-API-Key": GALILEO_API_KEY,
+                    "project": GALILEO_PROJECT_NAME,
+                    "logstream": os.getenv("GALILEO_LOG_STREAM", "default"),
+                },
+            )
         )
-        
-        # Check if already authorized
-        if auth_response.status == "completed":
-            print("✓ Already authorized\n")
-            return True
-        
-        # Display authorization URL
-        print(f"\nPlease authorize this tool by visiting:")
-        print(f"\n🔗 {auth_response.url}\n")
-        print("After authorizing in your browser, press Enter to continue...")
-        
-        input()
-        
-        # Wait for authorization to complete
-        print("⏳ Waiting for authorization...")
-        arcade.auth.wait_for_completion(auth_response)
-        
-        print("✓ Authorization complete!\n")
-        return True
-        
-    except Exception as e:
-        print(f"Error during authorization: {e}", file=sys.stderr)
-        return False
+    )
+
+    trace.set_tracer_provider(provider)
+    LangChainInstrumentor().instrument(tracer_provider=provider)
+    return provider
 
 
-def _execute_tool_call(
-    tool_call: Dict[str, Any],
-    arcade: Arcade,
-    user_id: str,
-    round_num: int
-) -> Dict[str, Any]:
-    """Execute a single tool call with tracing."""
-    tool_name = tool_call["name"]
-    tool_args = tool_call["args"]
-    
-    print(f"[Round {round_num}] Executing: {tool_name}")
-    
-    try:
-        result = execute_tool_with_tracing(
-            tool_name=tool_name,
-            tool_executor=lambda: arcade.tools.execute(
-                tool_name=tool_name,
-                input=tool_args,
-                user_id=user_id
-            ),
-            inputs=tool_args
-        )
-        
-        return {
-            "tool_call_id": tool_call.get("id", ""),
-            "role": "tool",
-            "name": tool_name,
-            "content": str(result)
+async def read_last_email() -> str:
+    """Connect to Arcade MCP Gateway and read the last email."""
+    if not all([MCP_SERVER_URL, ARCADE_API_KEY, ARCADE_USER_ID, os.getenv("OPENAI_API_KEY")]):
+        sys.exit("Error: OPENAI_API_KEY, MCP_SERVER_URL, ARCADE_API_KEY, ARCADE_USER_ID required")
+
+    print(f"Connecting to: {MCP_SERVER_URL}\n")
+
+    client = MultiServerMCPClient({
+        "arcade": {
+            "url": MCP_SERVER_URL,
+            "transport": "streamable_http",
+            "headers": {
+                "Authorization": f"Bearer {ARCADE_API_KEY}",
+                "Arcade-User-ID": ARCADE_USER_ID,
+            },
         }
-        
-    except Exception as e:
-        error_msg = str(e)
-        
-        # Check if this is an authorization error (403)
-        if "403" in error_msg and "authorization required" in error_msg.lower():
-            print(f"\n⚠️  Tool requires authorization")
-            
-            # Handle authorization flow
-            if _handle_arcade_authorization(arcade, tool_name, user_id):
-                # Retry after authorization
-                print(f"Retrying {tool_name}...")
-                result = execute_tool_with_tracing(
-                    tool_name=tool_name,
-                    tool_executor=lambda: arcade.tools.execute(
-                        tool_name=tool_name,
-                        input=tool_args,
-                        user_id=user_id
-                    ),
-                    inputs=tool_args
-                )
-                
-                return {
-                    "tool_call_id": tool_call.get("id", ""),
-                    "role": "tool",
-                    "name": tool_name,
-                    "content": str(result)
-                }
-        
-        # Re-raise if not an auth error or auth failed
-        raise
+    })
+
+    all_tools = await client.get_tools()
+    tools = [t for t in all_tools if t.name in ALLOWED_TOOLS]
+    print(f"Tools: {[t.name for t in tools]}\n")
+
+    agent = create_react_agent(ChatOpenAI(model="gpt-4o"), tools)
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": "Read my last email"}]})
+
+    return result["messages"][-1].content
 
 
-def _process_tool_calls(
-    response: Any,
-    arcade: Arcade,
-    user_id: str,
-    messages: List[Dict[str, Any]],
-    round_num: int
-) -> None:
-    """Process all tool calls from agent response."""
-    for tool_call in response.tool_calls:
-        tool_result = _execute_tool_call(tool_call, arcade, user_id, round_num)
-        messages.append(response)
-        messages.append(tool_result)
+async def main() -> None:
+    """Entry point."""
+    tracer_provider = setup_telemetry()
 
-
-def execute_workflow(agent: Any, arcade: Arcade, user_id: str) -> Optional[str]:
-    """Execute email summary workflow with tracing."""
-    task = """
-    Complete this workflow:
-    1. Check my emails from today
-    2. Create a Google Doc titled "Email Summary - [Today's Date]" with a summary
-    3. Send me an email with subject "Your Email Summary" containing the doc link
-    """
-    
-    with tracer.start_as_current_span("email-summary-workflow"):
-        messages = [{"role": "user", "content": task}]
-        
-        for round_num in range(1, MAX_WORKFLOW_ROUNDS + 1):
-            response = agent.invoke(messages)
-            
-            if not response.tool_calls:
-                return response.content
-            
-            _process_tool_calls(response, arcade, user_id, messages, round_num)
-        
-        print(f"Warning: Workflow incomplete after {MAX_WORKFLOW_ROUNDS} rounds", 
-              file=sys.stderr)
-        return None
-
-
-def main() -> None:
-    """Run the demo workflow."""
-    print("=" * 60)
-    print("Arcade + Galileo Integration Demo")
-    print("=" * 60)
-    print()
-    
-    validate_environment()
-    
     try:
-        tools, arcade, user_id = load_arcade_tools()
-        agent = create_agent(tools)
-        
-        print("Executing workflow...\n")
-        result = execute_workflow(agent, arcade, user_id)
-        
-        if result:
-            print("\n" + "=" * 60)
-            print("Workflow completed!")
-            print("=" * 60)
-            print(f"\n{result}")
-        
-        print(f"\n📊 View traces: https://app.galileo.ai")
-        print(f"   Project: {os.getenv('GALILEO_PROJECT_NAME')}")
-        
-    except KeyboardInterrupt:
-        print("\nInterrupted", file=sys.stderr)
-        sys.exit(130)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        response = await read_last_email()
+        print(response)
+    finally:
+        tracer_provider.force_flush()
+        print(f"\n📊 Traces: https://app.galileo.ai (project: {GALILEO_PROJECT_NAME})")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
